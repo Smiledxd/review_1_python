@@ -3,19 +3,19 @@
 Uso (desde la raíz del repo):
     python3 tools/verificar_notebook.py
 
-Criterios que comprueba:
- 1. Estructura: nbformat 4 válido, kernel python3, sin outputs, solo biblioteca estándar.
- 2. Con SOLUCIONES en lugar de plantillas: todo corre y todos los asserts pasan.
-    Con PLANTILLAS sin resolver: la validación de cada ejercicio falla (ningún assert pasa gratis).
- 3. Los valores esperados se recalculan de forma independiente (aquí sí: collections, itertools,
-    statistics, heapq...) y coinciden con lo que producen las soluciones.
- 4. Las trampas del reto final funcionan (min sin key, continue en montos 0, `<=` en el empate).
- 5. Mutantes (errores típicos inyectados en las soluciones) son detectados por los asserts.
+Qué comprueba:
+ 1. Estructura: nbformat 4 válido, kernel python3, sin outputs, solo biblioteca estándar, formato de cada ejercicio.
+ 2. Ejecuta el notebook completo dos veces:
+    - con las SOLUCIONES del anexo en lugar de las plantillas: todo corre y cada ✅ Verificar termina en 🎉;
+    - con las PLANTILLAS sin resolver: cada ✅ Verificar marca ❌ y ningún punto sale ✅ gratis.
+ 3. Recalcula los valores esperados de forma independiente (aquí sí: collections, itertools, statistics, heapq)
+    y los compara con lo que producen las soluciones.
+ 4. Las trampas del reto final cambian el resultado y el verificador las reconoce con su mensaje.
+ 5. Mutantes (errores típicos inyectados en las soluciones) son detectados por los verificadores.
 """
 
 import ast
 import contextlib
-import copy
 import heapq
 import io
 import itertools
@@ -34,562 +34,403 @@ import nbformat  # noqa: E402
 RAIZ = Path(__file__).resolve().parent.parent
 RUTA = RAIZ / "sesiones" / "refuerzo_python_puro.ipynb"
 
-resultados = []  # (criterio, ok, detalle)
+resultados = []
 
 
 def registrar(criterio, ok, detalle=""):
-    resultados.append((criterio, ok, detalle))
+    resultados.append((criterio, ok))
     print(("✅" if ok else "❌"), criterio, ("— " + detalle) if detalle else "")
 
 
 # ----------------------------------------------------------------------
-# Utilidades de ejecución
+# Lectura y ejecución
 # ----------------------------------------------------------------------
 def ejecutar(src, ns, nombre="celda"):
-    """Ejecuta `src` en `ns` capturando stdout. Devuelve el texto impreso."""
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         exec(compile(src, nombre, "exec"), ns)
     return buf.getvalue()
 
 
-def ns_nuevo():
-    return {"__name__": "__main__"}
-
-
-def es_ejercicio_plantilla(celda):
-    return celda.id.startswith("ej-") and celda.id.endswith("-plantilla")
-
-
-def ids_ejercicios(nb):
-    return [c.id[3:-len("-plantilla")] for c in nb.cells if es_ejercicio_plantilla(c)]
-
-
 def celda(nb, id):
+    return next(c for c in nb.cells if c.id == id)
+
+
+def claves(nb):
+    return [c.id[3:-len("-plantilla")] for c in nb.cells if c.id.startswith("ej-") and c.id.endswith("-plantilla")]
+
+
+def soluciones(nb):
+    sol = {}
+    for k in claves(nb):
+        texto = celda(nb, f"ej-{k}-solucion").source
+        sol[k] = re.search(r"```python\n(.*?)\n```", texto, re.S).group(1)
+    return sol
+
+
+def correr(nb, modo, reemplazos=None):
+    """Ejecuta todas las celdas de código en orden. modo: 'soluciones' o 'plantillas'.
+    Devuelve (namespace, salidas de cada verificar, errores)."""
+    sol = soluciones(nb)
+    reemplazos = reemplazos or {}
+    ns = {"__name__": "__main__"}
+    salidas, errores = {}, []
     for c in nb.cells:
-        if c.id == id:
-            return c
-    raise KeyError(id)
+        if c.cell_type != "code":
+            continue
+        src = c.source
+        if c.id.endswith("-plantilla"):
+            k = c.id[3:-len("-plantilla")]
+            src = reemplazos.get(k, sol[k] if modo == "soluciones" else src)
+        try:
+            salida = ejecutar(src, ns, c.id)
+        except Exception as e:  # noqa: BLE001
+            errores.append(f"{c.id}: {type(e).__name__}: {e}")
+            continue
+        if c.id.endswith("-verificar"):
+            salidas[c.id[3:-len("-verificar")]] = salida
+    return ns, salidas, errores
 
 
-def usa_matplotlib(src):
-    return "matplotlib" in src
+def verificar_aislado(nb, k, codigo):
+    """Setup + un solo código + su verificador, en un namespace nuevo."""
+    ns = {"__name__": "__main__"}
+    ejecutar(celda(nb, "setup").source, ns)
+    ejecutar(codigo, ns, f"ej-{k}")
+    return ejecutar(celda(nb, f"ej-{k}-verificar").source, ns), ns
 
 
 # ----------------------------------------------------------------------
-# Oráculos independientes: reciben el namespace (con los datos) y devuelven
-# {variable: valor_esperado}. Usan herramientas que el notebook no usa.
+# Oráculos independientes
 # ----------------------------------------------------------------------
 def r2(x):
     return round(x, 2)
 
 
-def _acumular(saldo_inicial, movimientos):
-    return list(itertools.accumulate((m[2] for m in movimientos), initial=saldo_inicial))[1:]
+def saldos(inicial, movs):
+    return list(itertools.accumulate((m[2] for m in movs), initial=inicial))[1:]
 
 
-def o_1_1(ns):
-    return {"conteo_por_categoria": dict(Counter(v[1] for v in ns["ventas"]))}
+def agrupar(registros, filtro=lambda m: True, valor=lambda m: m[2]):
+    g = defaultdict(list)
+    for m in registros:
+        if filtro(m):
+            g[m[1]].append(valor(m))
+    return g
 
 
-def o_1_2(ns):
-    grupos = defaultdict(list)
-    for _, cat, monto in ns["ventas_semana"]:
-        grupos[cat].append(monto)
-    return {"total_por_categoria": {c: r2(math.fsum(v)) for c, v in grupos.items()}}
+def cruces(inicial, movs):
+    s = saldos(inicial, movs)
+    return sum(1 for a, b in itertools.pairwise([inicial] + s) if a >= 0 > b)
 
 
-def o_1_3(ns):
-    grupos = defaultdict(list)
-    for _, concepto, monto in ns["movimientos"]:
-        if monto < 0:
-            grupos[concepto].append(-monto)
-    return {"gasto_por_concepto": {c: r2(math.fsum(v)) for c, v in grupos.items()}}
+def oraculos(d):
+    """d: los datos originales. Devuelve {variable: valor esperado} para todo el notebook."""
+    e = {}
+    # Parte 1
+    e["conteo_por_categoria"] = dict(Counter(m[1] for m in d["ventas_bodega"]))
+    e["pred_in_cero"], e["pred_in_valor"], e["pred_error"] = True, False, "KeyError"
+    e["total_por_categoria"] = {c: r2(math.fsum(v)) for c, v in agrupar(d["ventas_bodega"]).items()}
+    e["pred_igual"], e["pred_redondeado"], e["pred_error_get"] = False, True, "TypeError"
+    e["egresos_por_concepto"] = {c: r2(math.fsum(v)) for c, v in
+                                 agrupar(d["movimientos_junio"], lambda m: m[2] < 0, lambda m: -m[2]).items()}
+    g = agrupar(d["compras_mes"])
+    e["compras_total"] = {c: r2(math.fsum(v)) for c, v in g.items()}
+    e["compras_cantidad"] = {c: len(v) for c, v in g.items()}
+    e["compras_promedio"] = {c: r2(statistics.fmean(v)) for c, v in g.items()}
+    e["categoria_mas_compras"] = max(g, key=lambda c: math.fsum(g[c]))
+    # Parte 2
+    s = saldos(d["saldo_inicial_caja"], d["movimientos_caja"])
+    e["saldos_caja"], e["saldo_cierre"] = [r2(x) for x in s], r2(s[-1])
+    movs, s = d["movimientos_cuenta"], saldos(d["saldo_inicial_cuenta"], d["movimientos_cuenta"])
+    rojos = [m[0] for m, x in zip(movs, s) if x < 0]
+    e["primer_rojo"], e["dias_en_rojo"] = rojos[0], rojos
+    e["entradas_en_rojo"] = cruces(d["saldo_inicial_cuenta"], movs)
+    e["primer_rojo_ahorro"] = next((m[0] for m, x in zip(d["movimientos_ahorro"],
+                                    saldos(d["saldo_inicial_ahorro"], d["movimientos_ahorro"])) if x < 0), None)
+    s = saldos(d["saldo_inicial_agosto"], d["movimientos_agosto"])
+    i = min(range(len(s)), key=s.__getitem__)
+    e["saldo_minimo"], e["fecha_saldo_minimo"] = r2(s[i]), d["movimientos_agosto"][i][0]
+    e["pred_con_menor"], e["pred_con_menor_igual"] = "Proveedor B", "Proveedor C"
+    deltas = [c if t == "entrada" else -c for _, t, c in d["kardex"]]
+    st = list(itertools.accumulate(deltas, initial=d["stock_inicial"]))
+    mn = d["stock_minimo"]
+    e["stock_final"] = st[-1]
+    e["fechas_bajo_minimo"] = [m[0] for m, x in zip(d["kardex"], st[1:]) if x < mn]
+    e["fecha_recuperacion"] = next((m[0] for m, a, b in zip(d["kardex"], st, st[1:]) if a < mn < b), None)
+    e["mayor_salida"] = max((m for m in d["kardex"] if m[1] == "salida"), key=lambda m: m[2])
+    # Parte 3
+    e.update(pred_a=False, pred_b=False, pred_c=True, pred_d=False, pred_e=True, pred_f=True,
+             pred_min=sorted(d["lista_prueba"])[0])
+    movs = d["movimientos_abril"]
+    e["mayor_ingreso"] = max(movs, key=lambda m: m[2])
+    e["mayor_egreso_abril"] = min(movs, key=lambda m: m[2])
+    e["top3_egresos"] = heapq.nsmallest(3, [m for m in movs if m[2] < 0], key=lambda m: m[2])
+    f, v, c = d["fechas_semana"], d["ventas_dia"], d["clientes_dia"]
+    e["venta_por_fecha"] = {a: b for a, b in zip(f, v)}
+    orden = sorted(range(len(f)), key=lambda j: (-v[j], c[j]))
+    e["ranking"] = [(j + 1, f[j], v[j], c[j]) for j in orden]
+    e["dia_ganador"], e["fecha_ganadora"] = orden[0] + 1, f[orden[0]]
+    tabla = dict(zip(d["locales"], d["ventas_mensuales"]))
+    e["total_por_local"] = {k: sum(fila) for k, fila in tabla.items()}
+    e["mejor_mes_por_local"] = {k: max(range(len(fila)), key=fila.__getitem__) + 1 for k, fila in tabla.items()}
+    e["local_top"] = max(e["total_por_local"], key=e["total_por_local"].get)
+    # Reto y pro
+    movs, si = d["movimientos"], d["saldo_inicial"]
+    s = saldos(si, movs)
+    gasto = {k: r2(math.fsum(x)) for k, x in agrupar(movs, lambda m: m[2] < 0, lambda m: -m[2]).items()}
+    rojos = [m[0] for m, x in zip(movs, s) if x < 0]
+    e.update(
+        saldo_final=r2(si + math.fsum(m[2] for m in movs)),
+        n_ingresos=sum(m[2] > 0 for m in movs), n_egresos=sum(m[2] < 0 for m in movs),
+        gasto_por_concepto=gasto, mayor_egreso=min(movs, key=lambda m: m[2]),
+        dias_sobregiro=rojos, veces_en_sobregiro=cruces(si, movs),
+        primer_dia_sobregiro=rojos[0] if rojos else None, concepto_mas_gasto=max(gasto, key=gasto.get),
+        saldo_por_fecha={m[0]: r2(x) for m, x in zip(movs, s)},
+        ranking_conceptos=sorted(gasto.items(), key=lambda kv: (-kv[1], kv[0])),
+        racha_mas_larga=max((len(list(grupo)) for rojo, grupo in itertools.groupby(x < 0 for x in s) if rojo), default=0),
+    )
+    return e
 
 
-def o_1_4(ns):
-    grupos = defaultdict(list)
-    for _, cat, monto in ns["gastos"]:
-        grupos[cat].append(monto)
-    totales = {c: math.fsum(v) for c, v in grupos.items()}
-    mejor = max(totales, key=totales.get)
-    assert sorted(totales.values())[-1] != sorted(totales.values())[-2], "empate en el mayor gasto"
-    return {
-        "total_por_categoria": {c: r2(t) for c, t in totales.items()},
-        "cantidad_por_categoria": {c: len(v) for c, v in grupos.items()},
-        "promedio_por_categoria": {c: r2(statistics.fmean(v)) for c, v in grupos.items()},
-        "categoria_mayor_gasto": mejor,
-    }
-
-
-def o_2_1(ns):
-    saldos = _acumular(ns["saldo_inicial"], ns["movimientos"])
-    return {"saldos": [r2(s) for s in saldos], "saldo_final": r2(saldos[-1])}
-
-
-def _primer_negativo(saldo_inicial, movimientos):
-    saldos = _acumular(saldo_inicial, movimientos)
-    return next((m[0] for m, s in zip(movimientos, saldos) if s < 0), None)
-
-
-def o_2_2(ns):
-    return {
-        "primer_dia_a": _primer_negativo(ns["saldo_inicial_a"], ns["movimientos_a"]),
-        "primer_dia_b": _primer_negativo(ns["saldo_inicial_b"], ns["movimientos_b"]),
-    }
-
-
-def o_2_3(ns):
-    saldos = _acumular(ns["saldo_inicial"], ns["movimientos"])
-    i = min(range(len(saldos)), key=lambda k: saldos[k])      # primer índice del mínimo
-    assert saldos.count(saldos[i]) == 2, "se esperaba un empate en el mínimo"
-    return {"saldo_minimo": r2(saldos[i]), "fecha_saldo_minimo": ns["movimientos"][i][0]}
-
-
-def o_2_4(ns):
-    minimo = ns["stock_minimo"]
-    kardex = ns["movimientos_kardex"]
-    deltas = [c if t == "entrada" else -c for _, t, c in kardex]
-    stocks = list(itertools.accumulate(deltas, initial=ns["stock_inicial"]))
-    assert all(s != minimo for s in stocks), "el stock no debe caer exactamente en el mínimo"
-    despues = stocks[1:]
-    bajo = [m[0] for m, s in zip(kardex, despues) if s < minimo]
-    recuperacion = next((m[0] for m, ant, s in zip(kardex, stocks, despues) if ant < minimo < s), None)
-    salidas = [m for m in kardex if m[1] == "salida"]
-    mayor = max(salidas, key=lambda m: m[2])                   # max devuelve el primero en empate
-    assert sum(1 for m in salidas if m[2] == mayor[2]) > 1, "se esperaba empate en la mayor salida"
-    return {"stock_final": stocks[-1], "fechas_bajo_minimo": bajo,
-            "fecha_recuperacion": recuperacion, "mayor_salida": mayor}
-
-
-def o_3_1(ns):
-    exprs = {
-        "pred_a": "('2026-11-03', 10) < ('2026-11-03', 9)",
-        "pred_b": "('b', 1) < ('a', 99)",
-        "pred_c": "(1, 500) < (1, 1000)",
-        "pred_d": "('2026-10-5', 0) < ('2026-10-15', 0)",
-        "pred_e": "'100' < '25'",
-        "pred_f": "(7, 3) < (7, 3, 0)",
-    }
-    esperado = {k: eval(v) for k, v in exprs.items()}
-    lp = ns["lista_prueba"]
-    # mínimo por tupla: ordenar y tomar el primero
-    esperado["pred_min"] = sorted(lp)[0]
-    assert esperado["pred_min"] != min(lp, key=lambda t: t[1]), "min por fecha debe diferir del min por monto"
-    return esperado
-
-
-def o_3_2(ns):
-    ordenados = sorted(ns["movimientos"], key=lambda m: m[2])
-    assert ordenados[0] != min(ns["movimientos"]) and ordenados[-1] != max(ns["movimientos"])
-    return {"mayor_ingreso": ordenados[-1], "mayor_egreso": ordenados[0]}
-
-
-def o_3_3(ns):
-    egresos = [m for m in ns["movimientos"] if m[2] < 0]
-    esperado = heapq.nsmallest(3, egresos, key=lambda m: m[2])
-    assert esperado != sorted(egresos)[:3]
-    return {"top3_egresos": esperado}
-
-
-def o_3_4(ns):
-    f, v, c = ns["fechas"], ns["ventas"], ns["clientes"]
-    orden = sorted(range(len(f)), key=lambda i: (-v[i], c[i]))
-    ranking = [(i + 1, f[i], v[i], c[i]) for i in orden]
-    ingenuo = max(range(len(v)), key=lambda i: v[i]) + 1       # el primero que alcanza el máximo
-    assert ranking[0][0] != ingenuo, "el desempate debe cambiar al ganador"
-    return {"ranking": ranking, "dia_ganador": ranking[0][0], "fecha_ganadora": ranking[0][1]}
-
-
-def o_reto(ns):
-    si, movs = ns["saldo_inicial"], ns["movimientos"]
-    saldos = _acumular(si, movs)
-    anteriores = [si] + saldos[:-1]
-    gasto = defaultdict(list)
-    for _, concepto, monto in movs:
-        if monto < 0:
-            gasto[concepto].append(-monto)
-    totales = {c: math.fsum(v) for c, v in gasto.items()}
-    egresos = [m for m in movs if m[2] < 0]
-    valores = sorted(totales.values())
-    assert valores[-1] != valores[-2], "no debe haber empate en el concepto con más gasto"
-    return {
-        "saldo_final": r2(si + math.fsum(m[2] for m in movs)),
-        "n_ingresos": sum(1 for m in movs if m[2] > 0),
-        "n_egresos": len(egresos),
-        "gasto_por_concepto": {c: r2(t) for c, t in totales.items()},
-        "mayor_egreso": min(egresos, key=lambda m: m[2]),
-        "dias_sobregiro": sum(1 for s in saldos if s < 0),
-        "veces_en_sobregiro": sum(1 for a, s in zip(anteriores, saldos) if a >= 0 and s < 0),
-        "primer_dia_sobregiro": next((m[0] for m, s in zip(movs, saldos) if s < 0), None),
-        "concepto_mas_gasto": max(totales, key=totales.get),
-    }
-
-
-ORACULOS = {
-    "1-1": o_1_1, "1-2": o_1_2, "1-3": o_1_3, "1-4": o_1_4,
-    "2-1": o_2_1, "2-2": o_2_2, "2-3": o_2_3, "2-4": o_2_4,
-    "3-1": o_3_1, "3-2": o_3_2, "3-3": o_3_3, "3-4": o_3_4,
-    "reto-a": o_reto, "reto-b": o_reto,
-}
-BUGS = {"1-3", "2-3", "3-3"}
-
-
-def iguales(real, esperado):
-    if isinstance(esperado, float) or isinstance(real, float):
-        return isinstance(real, (int, float)) and r2(real) == r2(esperado) and \
-            (not isinstance(esperado, float) or math.isclose(real, esperado, abs_tol=0.005))
-    if isinstance(esperado, dict):
-        return isinstance(real, dict) and real.keys() == esperado.keys() and \
-            all(iguales(real[k], esperado[k]) for k in esperado)
-    if isinstance(esperado, (list, tuple)):
-        return type(real) is type(esperado) and len(real) == len(esperado) and \
-            all(iguales(a, b) for a, b in zip(real, esperado))
-    return real == esperado
+def iguales(a, b):
+    if isinstance(b, bool) or b is None:
+        return type(a) is type(b) and a == b
+    if isinstance(b, float):
+        return isinstance(a, (int, float)) and r2(a) == r2(b)
+    if isinstance(b, dict):
+        return isinstance(a, dict) and a.keys() == b.keys() and all(iguales(a[k], b[k]) for k in b)
+    if isinstance(b, (list, tuple)):
+        return type(a) is type(b) and len(a) == len(b) and all(iguales(x, y) for x, y in zip(a, b))
+    return a == b
 
 
 # ----------------------------------------------------------------------
-# Criterio 1: estructura
+# 1. Estructura
 # ----------------------------------------------------------------------
 def verificar_estructura(nb):
     nbformat.validate(nb)
-    ok = nb.nbformat == 4 and nb.metadata["kernelspec"]["name"] == "python3"
-    sin_outputs = all(
-        c.cell_type != "code" or (not c.outputs and c.execution_count is None) for c in nb.cells
-    )
-    registrar("1a. nbformat 4 válido, kernel python3", ok, f"nbformat {nb.nbformat}.{nb.nbformat_minor}")
-    registrar("1b. sin outputs guardados", sin_outputs)
+    registrar("1a. nbformat 4 válido y kernel python3",
+              nb.nbformat == 4 and nb.metadata["kernelspec"]["name"] == "python3", f"{len(nb.cells)} celdas")
+    registrar("1b. sin outputs guardados",
+              all(c.cell_type != "code" or (not c.outputs and c.execution_count is None) for c in nb.cells))
 
-    prohibidos = {"pandas", "numpy", "collections", "itertools"}
-    permitidos = {"math", "matplotlib", "matplotlib.pyplot"}
+    codigos = [(c.id, c.source) for c in nb.cells if c.cell_type == "code"]
+    codigos += [(f"solucion-{k}", s) for k, s in soluciones(nb).items()]
+    permitidos = {"copy", "math", "matplotlib.pyplot"}
     malos = []
-    for c in nb.cells:
-        if c.cell_type != "code":
-            continue
-        for nodo in ast.walk(ast.parse(c.source)):
-            nombres = []
+    for id_, src in codigos:
+        for nodo in ast.walk(ast.parse(src)):
             if isinstance(nodo, ast.Import):
-                nombres = [a.name for a in nodo.names]
+                malos += [(id_, a.name) for a in nodo.names if a.name not in permitidos]
             elif isinstance(nodo, ast.ImportFrom):
-                nombres = [nodo.module]
-            for n in nombres:
-                if n not in permitidos:
-                    malos.append((c.id, n))
-        if any(p in c.source for p in ("pandas", "numpy", "collections", "itertools")):
-            malos.append((c.id, "menciona biblioteca prohibida"))
+                malos.append((id_, nodo.module))
+        malos += [(id_, p) for p in ("pandas", "numpy", "collections", "itertools") if p in src]
     registrar("1c. solo biblioteca estándar (+ matplotlib en el gráfico)", not malos, str(malos))
 
-    texto = "\n".join(c.source for c in nb.cells).lower()
-    texto_sin_auto = texto.replace("autoevaluación", "")      # «Checklist de autoevaluación» es parte del cierre pedido
-    prohibidas = [p for p in ("pseint", "curso", "evaluación", "evaluacion", "examen", "profesor", "clase de")
-                  if p in texto_sin_auto]
-    registrar("1d. contenido sin referencias a cursos/evaluaciones/PSeInt", not prohibidas, str(prohibidas))
-    registrar("1e. contenido en español con checklist y predicciones",
-              texto.count("predice antes de ejecutar") >= 15, f"{texto.count('predice antes de ejecutar')} celdas de predicción")
+    texto = "\n".join(c.source for c in nb.cells).lower().replace("autoevaluación", "")
+    prohibidas = [p for p in (r"pseint", r"curso", r"evaluaci", r"examen", r"profesor", r"\bnotas?\b", r"calificaci")
+                  if re.search(p, texto)]
+    registrar("1d. sin referencias a cursos, evaluaciones, notas ni PSeInt", not prohibidas, str(prohibidas))
 
-    # formato de pistas y soluciones
     problemas = []
-    for k in ids_ejercicios(nb):
-        for c in nb.cells:
-            if c.id.startswith(f"ej-{k}-pista-"):
-                primera = c.source.splitlines()[0]
-                if not re.fullmatch(r'# @title 💡 Pista \d \{ display-mode: "form" \}', primera):
-                    problemas.append(c.id)
-                arbol = ast.parse(c.source)
-                if not all(isinstance(n, ast.Expr) for n in arbol.body):
-                    problemas.append(c.id + " (no solo imprime)")
-        sol = celda(nb, f"ej-{k}-solucion").source
-        if not re.match(r'# @title 🔒 Solución .+ \(ábrela después de intentarlo\) \{ display-mode: "form" \}', sol):
-            problemas.append(f"ej-{k}-solucion (título)")
-        pistas = [c for c in nb.cells if c.id.startswith(f"ej-{k}-pista-")]
-        if not 1 <= len(pistas) <= 2:
-            problemas.append(f"ej-{k}: pistas={len(pistas)}")
-        lineas = sol.split("# Error típico:\n")[1].split("\n\n")[0].splitlines()
-        if not 2 <= len(lineas) <= 3:
-            problemas.append(f"ej-{k}: {len(lineas)} líneas de error típico")
-        val = ast.parse(celda(nb, f"ej-{k}-validacion").source)
-        if any(isinstance(n, ast.Assert) and n.msg is None for n in val.body):
-            problemas.append(f"ej-{k}: assert sin mensaje")
-    registrar("1f. pistas (1-2, form, solo imprimen), soluciones (form, 2-3 líneas de error) y asserts con mensaje",
-              not problemas, str(problemas))
+    if not celda(nb, "setup").source.startswith('#@title ⚙️ Setup: ejecuta esta celda y no la edites { display-mode: "form" }'):
+        problemas.append("setup sin #@title")
+    for k in claves(nb):
+        if celda(nb, f"ej-{k}-verificar").source.splitlines()[0] != "# ✅ Verificar":
+            problemas.append(f"{k}: verificar")
+        pistas = [c for c in nb.cells if c.id == f"ej-{k}-pistas"]
+        n = pistas[0].source.count("<details>") if pistas else 0
+        if k != "pro" and not 1 <= n <= 2:
+            problemas.append(f"{k}: {n} pistas")
+        if "Error típico" not in celda(nb, f"ej-{k}-solucion").source:
+            problemas.append(f"{k}: solución sin error típico")
+    predicciones = sum(1 for c in nb.cells if c.cell_type == "code" and c.source.startswith("# 🔮 Predice antes de ejecutar"))
+    registrar("1e. formato: setup activable, ✍️/✅/💡 por ejercicio, soluciones plegadas en el anexo",
+              not problemas, f"{len(claves(nb))} ejercicios, {predicciones} ejemplos con 🔮" + (f"; {problemas}" if problemas else ""))
+    anexo = [i for i, c in enumerate(nb.cells) if c.id == "anexo-titulo"][0]
+    registrar("1f. ninguna solución visible fuera del anexo final",
+              all(i > anexo for i, c in enumerate(nb.cells) if c.id.endswith("-solucion"))
+              and all("<details>" in c.source for c in nb.cells if c.id.endswith("-solucion")))
 
 
 # ----------------------------------------------------------------------
-# Criterio 2 y 3: ejecución con soluciones (y oráculos)
+# 2 y 3. Ejecución con soluciones y con plantillas; oráculos
 # ----------------------------------------------------------------------
-def correr_notebook_soluciones(nb, matplotlib_ok):
-    ns = ns_nuevo()
-    fallos, validaciones, omitidas = [], 0, []
-    for c in nb.cells:
-        if c.cell_type != "code":
-            continue
-        if c.id.endswith("-solucion") or "-pista-" in c.id:
-            # se ejecutan aparte; las pistas solo imprimen
-            if "-pista-" in c.id:
-                ejecutar(c.source, ns_nuevo(), c.id)
-            continue
-        if es_ejercicio_plantilla(c):
-            k = c.id[3:-len("-plantilla")]
-            src = celda(nb, f"ej-{k}-solucion").source
-            local = ns_nuevo()                       # cada ejercicio en un namespace vacío
-            try:
-                ejecutar(src, local, f"ej-{k}-solucion")
-                esperado = ORACULOS[k](local)
-                for var, valor in esperado.items():
-                    if not iguales(local.get(var), valor):
-                        fallos.append(f"{k}: {var} = {local.get(var)!r} ≠ oráculo {valor!r}")
-                salida = ejecutar(celda(nb, f"ej-{k}-validacion").source, local, f"ej-{k}-validacion")
-                assert "✅" in salida
-                validaciones += 1
-            except Exception as e:  # noqa: BLE001
-                fallos.append(f"{k}: {type(e).__name__}: {e}")
-            continue
-        if c.id.endswith("-validacion"):
-            continue                                   # ya corrida junto con su ejercicio
-        if usa_matplotlib(c.source) and not matplotlib_ok:
-            omitidas.append(c.id)
-            continue
-        try:
-            ejecutar(c.source, ns, c.id)
-        except Exception as e:  # noqa: BLE001
-            fallos.append(f"{c.id}: {type(e).__name__}: {e}")
-    return fallos, validaciones, omitidas
+def verificar_ejecucion(nb):
+    ns, salidas, errores = correr(nb, "soluciones")
+    malos = [k for k, s in salidas.items() if "🎉" not in s or "❌" in s]
+    registrar("2a. con soluciones: todo corre y cada ✅ Verificar termina en 🎉",
+              not errores and not malos and len(salidas) == len(claves(nb)),
+              f"{len(salidas)} verificadores" + (f"; errores {errores}" if errores else "") + (f"; fallan {malos}" if malos else ""))
+    for k in malos:
+        print(salidas[k])
 
+    esperado = oraculos(ns["_D"])
+    distintos = [f"{v}: {ns.get(v)!r} ≠ {x!r}" for v, x in esperado.items() if not iguales(ns.get(v), x)]
+    registrar("3.  valores recalculados de forma independiente coinciden con las soluciones",
+              not distintos, f"{len(esperado)} variables" + (f"; {distintos}" if distintos else ""))
 
-def verificar_soluciones(nb):
-    try:
-        import matplotlib  # noqa: F401
-        matplotlib_ok = True
-    except ImportError:
-        matplotlib_ok = False
-    fallos, validaciones, omitidas = correr_notebook_soluciones(nb, matplotlib_ok)
-    registrar("2a. con soluciones: todas las celdas corren y los asserts pasan",
-              not fallos and validaciones == len(ids_ejercicios(nb)),
-              f"{validaciones} validaciones OK" + (f"; omitidas (sin matplotlib): {omitidas}" if omitidas else "")
-              + (f"; FALLOS: {fallos}" if fallos else ""))
-    registrar("3.  valores esperados recalculados de forma independiente coinciden",
-              not any("oráculo" in f for f in fallos), f"{len(ORACULOS)} oráculos")
+    intactos = [k for k in ns["_D"] if ns[k] != ns["_D"][k]]
+    ns_p, salidas_p, errores_p = correr(nb, "plantillas")
+    intactos += [k for k in ns_p["_D"] if ns_p[k] != ns_p["_D"][k]]
+    registrar("2b. los ejemplos y las soluciones no modifican los datos del setup", not intactos, str(intactos))
 
+    gratis = {k: s.count("✅") for k, s in salidas_p.items() if s.count("✅")}
+    sin_error = [k for k, s in salidas_p.items() if "❌" not in s or "🎉" in s]
+    registrar("2c. con plantillas sin resolver: cada verificador marca ❌ y ningún punto sale ✅ gratis",
+              not errores_p and not gratis and not sin_error and len(salidas_p) == len(claves(nb)),
+              f"{sum(s.count('❌') for s in salidas_p.values())} ❌ en {len(salidas_p)} verificadores"
+              + (f"; ✅ gratis {gratis}" if gratis else "") + (f"; sin ❌ {sin_error}" if sin_error else "")
+              + (f"; errores {errores_p}" if errores_p else ""))
 
-def verificar_soluciones_standalone(nb):
-    """Cada celda de solución también corre sola y es coherente con su validación (incluye el reto)."""
-    malos = []
-    for k in ids_ejercicios(nb):
-        ns = ns_nuevo()
-        try:
-            ejecutar(celda(nb, f"ej-{k}-solucion").source, ns)
-        except Exception as e:  # noqa: BLE001
-            malos.append((k, str(e)))
-    registrar("2b. cada celda de solución corre por sí sola", not malos, str(malos))
+    solos = []
+    for k, codigo in soluciones(nb).items():
+        salida, _ = verificar_aislado(nb, k, codigo)
+        if "🎉" not in salida:
+            solos.append(k)
+    registrar("2d. cada solución funciona sola, solo con el setup", not solos, str(solos))
+
+    arbol = ast.parse(soluciones(nb)["reto-b"])
+    fors = [n for n in ast.walk(arbol) if isinstance(n, ast.For) and isinstance(n.iter, ast.Name) and n.iter.id == "movimientos"]
+    registrar("2e. la solución del reto · Parte B recorre `movimientos` con un único for", len(fors) == 1, f"{len(fors)} for")
 
 
 # ----------------------------------------------------------------------
-# Criterio 2 (plantillas): ningún assert pasa gratis
-# ----------------------------------------------------------------------
-def verificar_plantillas(nb):
-    malos = []
-    total_asserts = 0
-    for k in ids_ejercicios(nb):
-        ns = ns_nuevo()
-        ejecutar(celda(nb, f"ej-{k}-plantilla").source, ns, f"ej-{k}-plantilla")
-        val_src = celda(nb, f"ej-{k}-validacion").source
-        # 1) la validación completa debe fallar con AssertionError
-        try:
-            ejecutar(val_src, copy.copy(ns))
-            malos.append(f"{k}: la validación pasó con la plantilla")
-            continue
-        except AssertionError:
-            pass
-        except Exception as e:  # noqa: BLE001
-            malos.append(f"{k}: falló con {type(e).__name__} en vez de AssertionError")
-            continue
-        # 2) ningún assert individual pasa gratis (salvo el de integridad de datos y, en los bugs, ninguno)
-        arbol = ast.parse(val_src)
-        base = copy.copy(ns)
-        def con_assert(n):
-            return any(isinstance(x, ast.Assert) for x in ast.walk(n))
-
-        for nodo in arbol.body:
-            if not con_assert(nodo) and not isinstance(nodo, ast.Expr):
-                exec(compile(ast.Module([nodo], []), "val", "exec"), base)
-        for nodo in arbol.body:
-            if not con_assert(nodo):
-                continue
-            total_asserts += 1
-            interno = next(x for x in ast.walk(nodo) if isinstance(x, ast.Assert))
-            mensaje = ast.unparse(interno.msg)
-            integridad = "modificaste" in mensaje
-            try:
-                exec(compile(ast.Module([nodo], []), "val", "exec"), copy.copy(base))
-                pasa = True
-            except Exception:  # noqa: BLE001
-                pasa = False
-            if pasa and not integridad and k not in BUGS:
-                malos.append(f"{k}: pasa gratis → {mensaje[:70]}")
-    registrar("2c. con plantillas sin resolver, la validación de cada ejercicio falla y ningún assert pasa gratis",
-              not malos, f"{total_asserts} asserts revisados" + (f"; {malos}" if malos else ""))
-
-
-# ----------------------------------------------------------------------
-# Criterio 4: trampas del reto final
+# 4. Trampas del reto final
 # ----------------------------------------------------------------------
 def verificar_trampas(nb):
-    ns = ns_nuevo()
-    ejecutar(celda(nb, "ej-reto-a-solucion").source, ns)
-    si, movs = ns["saldo_inicial"], ns["movimientos"]
-    esperado = o_reto(ns)
-    detalles = []
+    _, ns = verificar_aislado(nb, "reto-a", soluciones(nb)["reto-a"])
+    si, movs = ns["_D"]["saldo_inicial"], ns["_D"]["movimientos"]
+    e = oraculos(ns["_D"])
 
-    # a) min(movimientos) sin key
-    ingenuo = min(movs)
-    a = ingenuo != esperado["mayor_egreso"]
-    detalles.append(f"min sin key → {ingenuo}")
-
-    # b) continue en montos 0 antes del chequeo de sobregiro
-    saldo, dias = si, 0
-    for fecha, concepto, monto in movs:
+    saldo, con_continue = si, []
+    for fecha, _, monto in movs:
         if monto == 0:
             continue
         saldo += monto
         if saldo < 0:
-            dias += 1
-    b = dias != esperado["dias_sobregiro"]
-    detalles.append(f"con continue dias={dias} (correcto {esperado['dias_sobregiro']})")
-
-    # c) `<=` en lugar de `<`
+            con_continue.append(fecha)
     mejor = None
     for m in movs:
         if m[2] < 0 and (mejor is None or m[2] <= mejor[2]):
             mejor = m
-    c = mejor != esperado["mayor_egreso"]
-    detalles.append(f"con <= → {mejor}")
+    trampas = [
+        ("4a. min(movimientos) sin key", "mayor_egreso", min(movs), "más ANTIGUO"),
+        ("4b. `continue` en el monto 0 antes del chequeo", "dias_sobregiro", con_continue, "`continue`"),
+        ("4c. `<=` en vez de `<`", "mayor_egreso", mejor, "empate"),
+        ("4d. saldo arrancando en 0", "saldo_final", r2(sum(m[2] for m in movs)), "saldo inicial"),
+        ("4e. días en vez de entradas", "veces_en_sobregiro", len(e["dias_sobregiro"]), "no de entradas"),
+    ]
+    for nombre, var, valor, mensaje in trampas:
+        original = ns[var]
+        ns[var] = valor                      # los check_* leen este mismo namespace
+        salida = ejecutar(celda(nb, "ej-reto-a-verificar").source, ns)
+        ns[var] = original
+        linea = next((l for l in salida.splitlines() if f"`{var}`" in l), "")
+        registrar(f"{nombre}: cambia `{var}` y el verificador lo explica",
+                  not iguales(valor, e[var]) and linea.startswith("❌") and mensaje in linea, f"{valor!r} → {linea[:110]}")
 
-    registrar("4a. min(movimientos) sin key da un resultado distinto", a, detalles[0])
-    registrar("4b. `continue` en montos 0 antes del chequeo cambia dias_sobregiro", b, detalles[1])
-    registrar("4c. `<=` en vez de `<` cambia mayor_egreso", c, detalles[2])
-
-    # otras trampas declaradas
-    saldos = _acumular(si, movs)
+    s = saldos(si, movs)
     egresos = [m for m in movs if m[2] < 0]
-    conteo_concepto = Counter(m[1] for m in egresos)
+    conceptos = Counter(m[1] for m in egresos)
     fechas = [m[0] for m in movs]
     checks = {
         "14-18 movimientos": 14 <= len(movs) <= 18,
         "saldo inicial positivo": si > 0,
         "fechas únicas y ordenadas": fechas == sorted(set(fechas)),
-        "ajuste de 0 dentro de un día en sobregiro": any(m[2] == 0 and s < 0 for m, s in zip(movs, saldos)),
-        "empate en el mayor egreso": sum(1 for m in egresos if m[2] == esperado["mayor_egreso"][2]) >= 2,
-        "la fecha más antigua NO es el mayor egreso": min(movs)[0] != esperado["mayor_egreso"][0],
-        "concepto con un solo movimiento": 1 in conteo_concepto.values(),
-        "dos entradas distintas en sobregiro": esperado["veces_en_sobregiro"] == 2,
+        "ajuste de 0 en un día en sobregiro": any(m[2] == 0 and x < 0 for m, x in zip(movs, s)),
+        "empate en el mayor egreso": sum(m[2] == e["mayor_egreso"][2] for m in egresos) >= 2,
+        "la fecha más antigua no es el mayor egreso": min(movs) != e["mayor_egreso"],
+        "concepto con un solo egreso": 1 in conceptos.values(),
+        "dos entradas en sobregiro": e["veces_en_sobregiro"] == 2,
     }
-    registrar("4d. el dataset activa todas las trampas pedidas", all(checks.values()),
+    registrar("4f. el dataset del reto activa todas las trampas", all(checks.values()),
               ", ".join(k for k, v in checks.items() if not v) or "todas activas")
 
 
 # ----------------------------------------------------------------------
-# Reto Parte B: un solo for
-# ----------------------------------------------------------------------
-def verificar_un_solo_for(nb):
-    arbol = ast.parse(celda(nb, "ej-reto-b-solucion").source)
-    sobre_movs = [n for n in ast.walk(arbol) if isinstance(n, ast.For)
-                  and isinstance(n.iter, ast.Name) and n.iter.id == "movimientos"]
-    registrar("2d. la solución de la Parte B recorre `movimientos` con un único for", len(sobre_movs) == 1,
-              f"{len(sobre_movs)} for sobre movimientos")
-
-
-# ----------------------------------------------------------------------
-# Mutantes: errores típicos inyectados en las soluciones
+# 5. Mutantes: errores típicos inyectados en las soluciones
 # ----------------------------------------------------------------------
 MUTANTES = [
-    ("1-1", "conteo_por_categoria[categoria] = 1", "conteo_por_categoria[categoria] = 0", "inicializar el conteo en 0"),
-    ("1-2", "round(total_por_categoria[categoria], 2)", "total_por_categoria[categoria]", "no redondear"),
-    ("1-2", "total_por_categoria.get(categoria, 0) + monto", "monto", "no acumular"),
-    ("1-3", "if monto < 0:", "if monto != 0:", "filtrar != 0 en vez de < 0"),
-    ("1-3", ".get(concepto, 0) - monto", ".get(concepto, 0) + monto", "no invertir el signo"),
-    ("1-4", "total > mayor_total", "total < mayor_total", "mínimo en vez de máximo"),
-    ("1-4", "round(total / cantidad_por_categoria[categoria], 2)", "total / cantidad_por_categoria[categoria]", "promedio sin redondear"),
-    ("2-1", "saldo = saldo_inicial            #", "saldo = 0            #", "arrancar el saldo en 0"),
-    ("2-1", "saldos.append(round(saldo, 2))", "saldos.append(saldo)", "no redondear los saldos"),
-    ("2-2", "break", "pass", "sin break (queda el último día)"),
-    ("2-3", "saldo_minimo = None      ", "saldo_minimo = 0         ", "mínimo inicializado en 0"),
-    ("2-3", "saldo < saldo_minimo:", "saldo <= saldo_minimo:", "<= (último empate)"),
-    ("2-4", "cantidad > mayor_salida[2]", "cantidad >= mayor_salida[2]", ">= (último empate)"),
-    ("2-4", "stock_anterior < stock_minimo and stock > stock_minimo", "stock > stock_minimo", "sin stock anterior"),
-    ("3-2", "min(movimientos, key=lambda m: m[2])", "min(movimientos)", "min sin key"),
-    ("3-3", "key=lambda m: m[2])[:3]", "key=lambda m: m[2], reverse=True)[:3]", "reverse=True con negativos"),
-    ("3-4", "(-r[2], r[3])", "(-r[2], -r[3])", "desempate invertido"),
-    ("3-4", "start=1", "start=0", "enumerate sin start=1"),
-    ("reto-a", "movimiento[2] < mayor_egreso[2]", "movimiento[2] <= mayor_egreso[2]", "<= en el empate"),
-    ("reto-a", "    saldo += monto\n    if saldo < 0:\n        dias_sobregiro += 1",
-     "    if monto == 0:\n        continue\n    saldo += monto\n    if saldo < 0:\n        dias_sobregiro += 1",
-     "continue en monto 0 antes del chequeo"),
-    ("reto-a", "saldo = saldo_inicial\nfor fecha, concepto, monto in movimientos:\n    saldo += monto\nsaldo_final",
-     "saldo = 0\nfor fecha, concepto, monto in movimientos:\n    saldo += monto\nsaldo_final", "saldo desde 0 (sin inicial)"),
-    ("reto-a", "        if saldo_anterior >= 0:\n            veces_en_sobregiro += 1", "        veces_en_sobregiro += 1",
-     "contar días como entradas"),
-    ("reto-b", "monto < mayor_egreso[2]", "monto <= mayor_egreso[2]", "<= en el empate"),
-    ("reto-b", "    saldo_anterior = saldo                            # al final de la vuelta",
-     "    pass", "no actualizar saldo_anterior"),
-    ("reto-b", "if monto > 0:\n        n_ingresos += 1\n    elif monto < 0:", "if monto >= 0:\n        n_ingresos += 1\n    elif monto < 0:",
-     "contar el 0 como ingreso"),
+    ("1", "conteo_por_categoria[categoria] = 1 ", "conteo_por_categoria[categoria] = 0 ", "Inicializaste en 0"),
+    ("1", "conteo_por_categoria[categoria] += 1", "conteo_por_categoria[categoria] += monto", "no un conteo"),
+    ("2", "round(total_por_categoria[categoria], 2)", "total_por_categoria[categoria]", "sin redondear"),
+    ("3", "if monto < 0:", "if monto != 0:", "ingresos"),
+    ("3", ".get(concepto, 0) - monto", ".get(concepto, 0) + monto", "positivo"),
+    ("4", "total > compras_total[categoria_mas_compras]", "total < compras_total[categoria_mas_compras]", "MENOR"),
+    ("4", "round(total / compras_cantidad[categoria], 2)", "total / compras_cantidad[categoria]", "sin redondear"),
+    ("5", "saldo = saldo_inicial_caja  ", "saldo = 0  ", "arrancaste el saldo en 0"),
+    ("5", "saldos_caja.append(round(saldo, 2))", "saldos_caja.append(saldo)", "sin redondear"),
+    ("5", "    saldo += monto  ", "    if monto == 0:\n        continue\n    saldo += monto  ", "un saldo por movimiento"),
+    ("6", "        break                                   # ya", "        pass                                    # ya", "`break`"),
+    ("6", "    saldo += monto                              # sin continue",
+     "    if monto == 0:\n        continue\n    saldo += monto                              # sin continue", "`continue`"),
+    ("6", "        if saldo_anterior >= 0:\n            entradas_en_rojo += 1", "        entradas_en_rojo += 1", "no de entradas"),
+    ("7", "saldo_minimo = None    ", "saldo_minimo = 0       ", "centinela"),
+    ("7", "saldo < saldo_minimo:", "saldo <= saldo_minimo:", "`<=`"),
+    ("8", "cantidad > mayor_salida[2]", "cantidad >= mayor_salida[2]", "`>=`"),
+    ("8", "stock_anterior < stock_minimo and stock > stock_minimo", "stock > stock_minimo", "stock anterior"),
+    ("8", "    else:\n        stock -= cantidad\n        if mayor_salida",
+     "    else:\n        stock -= cantidad\n    if True:\n        if mayor_salida", "ENTRADA"),
+    ("10", "min(movimientos_abril, key=lambda m: m[2])", "min(movimientos_abril)", "más ANTIGUO"),
+    ("10", "key=lambda m: m[2])[:3]", "key=lambda m: m[2], reverse=True)[:3]", "reverse=True"),
+    ("11", "(-r[2], r[3])", "(-r[2],)", "desempate"),
+    ("11", "start=1", "start=0", "start=1"),
+    ("12", "if fila[j] > fila[mejor_j]:", "if fila[j] >= fila[mejor_j]:", "`>=`"),
+    ("12", "mejor_j + 1", "mejor_j", "súmale 1"),
+    ("reto-a", "mayor_egreso = min(movimientos, key=lambda m: m[2])", "mayor_egreso = min(movimientos)", "más ANTIGUO"),
+    ("reto-a", "    saldo += monto                          # sin continue",
+     "    if monto == 0:\n        continue\n    saldo += monto                          # sin continue", "`continue`"),
+    ("reto-a", "    if monto > 0:\n        n_ingresos += 1", "    if monto >= 0:\n        n_ingresos += 1", "monto 0 como ingreso"),
+    ("reto-a", "        if saldo_anterior >= 0:\n            veces_en_sobregiro += 1", "        veces_en_sobregiro += 1", "no de entradas"),
+    ("reto-b", "monto < mayor_egreso[2]", "monto <= mayor_egreso[2]", "empate"),
+    ("reto-b", "    saldo_anterior = saldo                         # al final", "    pass                                           # al final", "veces_en_sobregiro"),
+    ("reto-b", "saldo = saldo_inicial\n", "saldo = 0\n", "saldo inicial"),
+    ("pro", "        racha = 0", "        pass", "racha"),
+    ("pro", "(-kv[1], kv[0])", "(kv[1], kv[0])", "menor a mayor"),
 ]
 
 
 def verificar_mutantes(nb):
-    atrapados, escapados, no_aplicados = 0, [], []
-    for k, viejo, nuevo, descripcion in MUTANTES:
-        src = celda(nb, f"ej-{k}-solucion").source
-        if viejo not in src:
-            no_aplicados.append((k, descripcion))
+    sol = soluciones(nb)
+    atrapados, escapados = 0, []
+    for k, viejo, nuevo, mensaje in MUTANTES:
+        if viejo not in sol[k]:
+            escapados.append((k, "no aplicado", viejo[:30]))
             continue
-        mutado = src.replace(viejo, nuevo)
-        ns = ns_nuevo()
         try:
-            ejecutar(mutado, ns, f"mutante-{k}")
-            ejecutar(celda(nb, f"ej-{k}-validacion").source, ns, f"validacion-{k}")
-            escapados.append((k, descripcion))
-        except AssertionError:
-            atrapados += 1
-        except Exception as e:  # noqa: BLE001 — un crash también delata el error, pero lo anotamos
-            escapados.append((k, f"{descripcion} → {type(e).__name__}"))
-    registrar("5.  los asserts detectan errores típicos inyectados (mutantes)",
-              not escapados and not no_aplicados,
-              f"{atrapados}/{len(MUTANTES)} atrapados" + (f"; escapan: {escapados}" if escapados else "")
-              + (f"; no aplicados: {no_aplicados}" if no_aplicados else ""))
-
-
-# ----------------------------------------------------------------------
-# Tamaño de los datos (6 a 15 registros, salvo el reto)
-# ----------------------------------------------------------------------
-def verificar_tamano_datos(nb):
-    malos = []
-    for k in ids_ejercicios(nb):
-        if k.startswith("reto"):
+            salida, _ = verificar_aislado(nb, k, sol[k].replace(viejo, nuevo, 1))
+        except Exception as e:  # noqa: BLE001
+            escapados.append((k, f"{type(e).__name__}", mensaje))
             continue
-        ns = ns_nuevo()
-        ejecutar(celda(nb, f"ej-{k}-plantilla").source, ns)
-        for nombre, valor in ns.items():
-            if nombre.startswith("_") or not isinstance(valor, list) or not valor:
-                continue
-            if isinstance(valor[0], (tuple, str, float)) and nombre in (
-                "ventas", "ventas_semana", "movimientos", "gastos", "movimientos_a", "movimientos_b",
-                "movimientos_kardex", "lista_prueba", "fechas", "clientes",
-            ) and not 6 <= len(valor) <= 15:
-                malos.append((k, nombre, len(valor)))
-    registrar("6.  datos de los ejercicios entre 6 y 15 registros", not malos, str(malos))
+        if "❌" in salida and mensaje in salida:
+            atrapados += 1
+        else:
+            escapados.append((k, mensaje, salida.strip().splitlines()[1:4]))
+    registrar("5.  los verificadores detectan errores típicos inyectados y los nombran",
+              not escapados, f"{atrapados}/{len(MUTANTES)}" + (f"; escapan {escapados}" if escapados else ""))
+
+
+# ----------------------------------------------------------------------
+# 6. Tamaño de los datos
+# ----------------------------------------------------------------------
+def verificar_tamano(nb):
+    ns = {"__name__": "__main__"}
+    ejecutar(celda(nb, "setup").source, ns)
+    malos = [(k, len(v)) for k, v in ns["_D"].items()
+             if isinstance(v, list) and k not in ("movimientos", "locales", "ventas_mensuales") and not 6 <= len(v) <= 15]
+    registrar("6.  datos de los ejercicios entre 6 y 15 registros (reto: 14-18)",
+              not malos and 14 <= len(ns["_D"]["movimientos"]) <= 18, str(malos))
 
 
 def main():
     nb = nbformat.read(RUTA, as_version=4)
     verificar_estructura(nb)
-    verificar_soluciones(nb)
-    verificar_soluciones_standalone(nb)
-    verificar_plantillas(nb)
-    verificar_un_solo_for(nb)
+    verificar_ejecucion(nb)
     verificar_trampas(nb)
     verificar_mutantes(nb)
-    verificar_tamano_datos(nb)
+    verificar_tamano(nb)
     fallidos = [r for r in resultados if not r[1]]
     print(f"\n{len(resultados) - len(fallidos)}/{len(resultados)} comprobaciones OK")
     sys.exit(1 if fallidos else 0)
